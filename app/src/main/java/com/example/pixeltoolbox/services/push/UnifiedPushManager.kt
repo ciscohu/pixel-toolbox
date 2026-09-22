@@ -46,14 +46,18 @@ object UnifiedPushManager {
     suspend fun isPushServiceRunning(context: Context): Boolean = withContext(Dispatchers.IO) {
         if (!isXmsfInstalled(context)) return@withContext false
 
-        val sp = context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
-        val isSpOn = sp.getBoolean("mipush_enabled", false)
+        // Do not trust only the app's SharedPreferences flag: the package/service may have
+        // failed to install or start. Prefer the real process/service state.
+        val pid = ShizukuUtils.executeCommandOrNull("pidof $XMSF_PACKAGE")?.trim()
+        if (!pid.isNullOrBlank()) return@withContext true
 
-        val settingsRes = ShizukuUtils.executeCommandOrNull("settings get global pixeltoolbox_mipush_enabled")?.trim() == "1"
-        val psRes = ShizukuUtils.executeCommandOrNull("ps -A | grep $XMSF_PACKAGE")
-        val isProcessActive = !psRes.isNullOrBlank() && psRes.lines().any { it.contains(XMSF_PACKAGE) }
+        val serviceDump = ShizukuUtils.executeCommandOrNull(
+            "dumpsys activity services $XMSF_PACKAGE/.push.service.XMPushService"
+        ).orEmpty()
+        val serviceActive = serviceDump.contains("ServiceRecord") &&
+            serviceDump.contains(XMSF_PACKAGE)
 
-        return@withContext isSpOn || settingsRes || isProcessActive
+        return@withContext serviceActive
     }
 
     /**
@@ -108,46 +112,131 @@ object UnifiedPushManager {
     }
 
     /**
-     * 一键无感开启统一推送托管框架（包含挂载守护与状态双重持久化 + xmsf.apk 自动补全双重保险）
+     * 将内置 xmsf.apk 复制到 Shell 可读的 /data/local/tmp 后安装。
+     * Pixel Toolbox 自身的 cacheDir 对 Shizuku shell 不可直接读取，因此不能把
+     * app 私有缓存路径直接传给 pm install。
      */
-    suspend fun enablePushService(context: Context): Result<String> = withContext(Dispatchers.IO) {
-        // 双重保险 1: 检测 xmsf 是否已安装，若未安装或丢失则自动从 assets 释放并 pm install 静默安装
-        try {
-            context.packageManager.getApplicationInfo(XMSF_PACKAGE, 0)
-        } catch (e: Exception) {
-            try {
-                val apkFile = java.io.File(context.cacheDir, "xmsf.apk")
-                context.assets.open("xmsf.apk").use { input ->
-                    java.io.FileOutputStream(apkFile).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                ShizukuUtils.executeCommand("pm install -r -g ${apkFile.absolutePath}")
-                apkFile.delete()
-            } catch (_: Exception) {}
+    private suspend fun ensureXmsfInstalled(context: Context): Result<String> = withContext(Dispatchers.IO) {
+        if (isXmsfInstalled(context)) {
+            return@withContext Result.success("MiPush Framework 已安装")
         }
 
-        // 双重保险 2: 解锁权限、挂载守护、加入电池白名单、启动推送守护服务
-        val cmds = listOf(
-            "pm enable $XMSF_PACKAGE 2>/dev/null",
-            "pm grant $XMSF_PACKAGE android.permission.POST_NOTIFICATIONS 2>/dev/null",
-            "cmd notification set_notifications_enabled $XMSF_PACKAGE true 2>/dev/null",
-            "cmd appops set $XMSF_PACKAGE POST_NOTIFICATION allow 2>/dev/null",
-            "pm disable $XMSF_PACKAGE/top.trumeet.mipushframework.wizard.WelcomeActivity 2>/dev/null",
-            "cmd appops set $XMSF_PACKAGE RUN_IN_BACKGROUND allow 2>/dev/null",
-            "cmd appops set $XMSF_PACKAGE WAKE_LOCK allow 2>/dev/null",
-            "cmd appops set $XMSF_PACKAGE AUTO_START allow 2>/dev/null",
-            "dumpsys deviceidle whitelist +$XMSF_PACKAGE 2>/dev/null",
-            "am startservice -n $XMSF_PACKAGE/.push.service.XMPushService 2>/dev/null",
-            "echo 'enabled=true' > /data/system/pixeltoolbox_mipush.xml",
-            "chmod 644 /data/system/pixeltoolbox_mipush.xml",
-            "chcon u:object_r:system_file:s0 /data/system/pixeltoolbox_mipush.xml"
-        ).joinToString("; ")
+        val cacheFile = java.io.File(context.cacheDir, "xmsf.apk")
+        val tmpPath = "/data/local/tmp/pixeltoolbox_xmsf.apk"
 
-        val sp = context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
-        sp.edit().putBoolean("mipush_enabled", true).apply()
+        try {
+            context.assets.open("xmsf.apk").use { input ->
+                cacheFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
 
-        return@withContext ShizukuUtils.executeCommand(cmds)
+            if (!cacheFile.exists() || cacheFile.length() <= 0L) {
+                return@withContext Result.failure(Exception("内置 xmsf.apk 为空或不存在"))
+            }
+
+            val pushRes = ShizukuUtils.streamFileTo(
+                "cat > $tmpPath && chmod 644 $tmpPath",
+                cacheFile
+            )
+            if (pushRes.isFailure) {
+                return@withContext Result.failure(
+                    Exception("复制 xmsf.apk 到 /data/local/tmp 失败: ${pushRes.exceptionOrNull()?.message}")
+                )
+            }
+
+            val installRes = ShizukuUtils.executeCommand(
+                "pm install -r -g --user 0 $tmpPath"
+            )
+            // Always clean up the temporary APK. Cleanup failure must not mask install status.
+            ShizukuUtils.executeCommand("rm -f $tmpPath 2>/dev/null")
+
+            if (installRes.isFailure) {
+                return@withContext Result.failure(
+                    Exception("MiPush Framework 安装失败: ${installRes.exceptionOrNull()?.message}")
+                )
+            }
+
+            val verify = ShizukuUtils.executeCommandOrNull(
+                "pm list packages $XMSF_PACKAGE"
+            ).orEmpty()
+            if (!verify.contains("package:$XMSF_PACKAGE")) {
+                return@withContext Result.failure(
+                    Exception("pm install 已执行，但系统未检测到 $XMSF_PACKAGE")
+                )
+            }
+
+            return@withContext Result.success("MiPush Framework 安装成功")
+        } catch (e: Exception) {
+            return@withContext Result.failure(e)
+        } finally {
+            try { cacheFile.delete() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * 一键无感开启统一推送托管框架。
+     * 流程：确保安装 -> 启用包/权限 -> 启动 XMPushService -> 验证真实运行状态。
+     */
+    suspend fun enablePushService(context: Context): Result<String> = withContext(Dispatchers.IO) {
+        val installRes = ensureXmsfInstalled(context)
+        if (installRes.isFailure) {
+            return@withContext installRes
+        }
+
+        // Best-effort permission/background preparation. Some appops do not exist on every
+        // Android build, so non-critical failures should not abort the whole flow.
+        val prepCommands = listOf(
+            "pm enable --user 0 $XMSF_PACKAGE",
+            "pm grant $XMSF_PACKAGE android.permission.POST_NOTIFICATIONS 2>/dev/null || true",
+            "cmd notification set_notifications_enabled $XMSF_PACKAGE true 2>/dev/null || true",
+            "cmd appops set $XMSF_PACKAGE POST_NOTIFICATION allow 2>/dev/null || true",
+            "cmd appops set $XMSF_PACKAGE RUN_IN_BACKGROUND allow 2>/dev/null || true",
+            "cmd appops set $XMSF_PACKAGE WAKE_LOCK allow 2>/dev/null || true",
+            "cmd appops set $XMSF_PACKAGE AUTO_START allow 2>/dev/null || true",
+            "dumpsys deviceidle whitelist +$XMSF_PACKAGE 2>/dev/null || true",
+            "pm disable --user 0 $XMSF_PACKAGE/top.trumeet.mipushframework.wizard.WelcomeActivity 2>/dev/null || true"
+        )
+        for (cmd in prepCommands) {
+            val result = ShizukuUtils.executeCommand(cmd)
+            if (cmd.startsWith("pm enable") && result.isFailure) {
+                return@withContext Result.failure(
+                    Exception("MiPush Framework 启用失败: ${result.exceptionOrNull()?.message}")
+                )
+            }
+        }
+
+        val startRes = ShizukuUtils.executeCommand(
+            "am startservice --user 0 -n $XMSF_PACKAGE/.push.service.XMPushService"
+        )
+        if (startRes.isFailure) {
+            return@withContext Result.failure(
+                Exception("XMPushService 启动失败: ${startRes.exceptionOrNull()?.message}")
+            )
+        }
+
+        // Give the service a brief moment to create its process before verification.
+        kotlinx.coroutines.delay(800)
+
+        val installed = isXmsfInstalled(context)
+        val running = isPushServiceRunning(context)
+        if (!installed) {
+            return@withContext Result.failure(Exception("MiPush Framework 安装后校验失败"))
+        }
+        if (!running) {
+            val startOutput = startRes.getOrNull().orEmpty()
+            return@withContext Result.failure(
+                Exception("MiPush Framework 已安装，但 XMPushService 未进入运行状态。startservice 输出: $startOutput")
+            )
+        }
+
+        ShizukuUtils.executeCommand("settings put global pixeltoolbox_mipush_enabled 1")
+        context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("mipush_enabled", true)
+            .apply()
+
+        return@withContext Result.success("MiPush Framework 已安装并启动托管")
     }
 
     /**
@@ -167,44 +256,12 @@ object UnifiedPushManager {
     }
 
     /**
-     * 一键从 assets/xmsf.apk 在后台通过 Shizuku ADB 静默安装小米推送服务框架并完成全自动开启
+     * 显式安装入口：复用与“开启托管”完全相同的可靠安装流程。
      */
     suspend fun installBuiltinXmsf(context: Context): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val cacheFile = java.io.File(context.cacheDir, "xmsf.apk")
-            if (!cacheFile.exists() || cacheFile.length() == 0L) {
-                try {
-                    context.assets.open("xmsf.apk").use { input ->
-                        cacheFile.outputStream().use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                } catch (e: Exception) {
-                    return@withContext Result.failure(Exception("内置 xmsf.apk 放置在 assets/xmsf.apk 后即可支持静默一键安装"))
-                }
-            }
-
-            if (!cacheFile.exists() || cacheFile.length() == 0L) {
-                return@withContext Result.failure(Exception("未在 assets 目录找到 xmsf.apk 资源包"))
-            }
-
-            val tmpPath = "/data/local/tmp/xmsf_temp.apk"
-            val pushRes = ShizukuUtils.streamFileTo("cat > $tmpPath", cacheFile)
-            if (pushRes.isFailure) {
-                return@withContext Result.failure(Exception("推送到临时目录失败: ${pushRes.exceptionOrNull()?.message}"))
-            }
-
-            val installRes = ShizukuUtils.executeCommand("pm install -r -g $tmpPath; rm -f $tmpPath")
-            if (installRes.isFailure) {
-                return@withContext Result.failure(Exception("静默安装失败: ${installRes.exceptionOrNull()?.message}"))
-            }
-
-            // 安装完成后自动调用 enablePushService 赋予自启动与保活
-            enablePushService(context)
-            return@withContext Result.success("MiPush 框架已成功后台静默安装并开启托管！")
-        } catch (e: Exception) {
-            return@withContext Result.failure(e)
-        }
+        val installRes = ensureXmsfInstalled(context)
+        if (installRes.isFailure) return@withContext installRes
+        return@withContext enablePushService(context)
     }
 
     /**
