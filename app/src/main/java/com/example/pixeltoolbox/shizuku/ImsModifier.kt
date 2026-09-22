@@ -307,8 +307,18 @@ class ImsModifier : Instrumentation() {
                 }
             }
         } finally {
-            am.stopDelegateShellPermissionIdentity()
-            Log.i(TAG, "stopped shell permission delegation")
+            // Android 17 may remove this hidden IActivityManager method at runtime.
+            // Cleanup failure must not mask an already-successful CarrierConfig write.
+            runCatching {
+                am.stopDelegateShellPermissionIdentity()
+                Log.i(TAG, "stopped shell permission delegation")
+            }.onFailure {
+                Log.w(
+                    TAG,
+                    "stopDelegateShellPermissionIdentity unavailable; ignoring cleanup failure",
+                    it
+                )
+            }
         }
     }
 
