@@ -448,8 +448,20 @@ fun GeekToolsCard(context: Context, textColor: Color, addLog: (String) -> Unit, 
                                             isPushRunning = com.example.pixeltoolbox.services.push.UnifiedPushManager.isPushServiceRunning(context)
                                             managedPushApps = com.example.pixeltoolbox.services.push.UnifiedPushManager.getManagedApps(context)
                                             if (res.isSuccess) {
-                                                addLog("已开启统一推送托管")
-                                                Toast.makeText(context, "已开启统一推送托管", Toast.LENGTH_SHORT).show()
+                                                addLog("✅ ${res.getOrNull() ?: "已开启统一推送托管"}")
+                                                Toast.makeText(
+                                                    context,
+                                                    res.getOrNull() ?: "已开启统一推送托管",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            } else {
+                                                val error = res.exceptionOrNull()?.message ?: "未知错误"
+                                                addLog("❌ 统一推送开启失败: $error")
+                                                Toast.makeText(
+                                                    context,
+                                                    "统一推送开启失败: $error",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
                                             }
                                         }
                                     }
