@@ -117,7 +117,13 @@ class ConfigReaderInstrumentation : Instrumentation() {
 
                 results.putBoolean(KEY_RESULT, true)
             } finally {
-                am.javaClass.getMethod("stopDelegateShellPermissionIdentity").invoke(am)
+                // Android 17 may not expose this hidden cleanup method.
+                // Reading CarrierConfig should still succeed if cleanup is unavailable.
+                runCatching {
+                    am.javaClass
+                        .getMethod("stopDelegateShellPermissionIdentity")
+                        .invoke(am)
+                }
             }
         } catch (t: Throwable) {
             results.putBoolean(KEY_RESULT, false)
