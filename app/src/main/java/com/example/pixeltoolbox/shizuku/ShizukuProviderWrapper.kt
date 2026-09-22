@@ -167,6 +167,9 @@ class ShizukuProviderWrapper : ShizukuProvider() {
                 lower.contains("system app") ||
                 lower.contains("securityexception") ||
                 lower.contains("security exception") ||
+                lower.contains("nosuchmethoderror") ||
+                lower.contains("stopdelegateshellpermissionidentity") ||
+                lower.contains("startdelegateshellpermissionidentity") ||
                 lower.contains("empty result")
         }
     }
